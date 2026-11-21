@@ -1,0 +1,204 @@
+name: RG1 - Diagnostico ROM y arranque
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rg1-rom-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    permissions:
+      contents: read
+    steps:
+      - name: Obtener codigo
+        uses: actions/checkout@v4
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev curl xz-utils patch python3 cmake ninja-build git
+      - name: Construir toolchain XSDK
+        env:
+          JOBS: "4"
+        run: |
+          PREFIX="$HOME/xsdk-gcc" WORK="$HOME/xsdk-gcc-work" bash tools/toolchain/build.sh
+          "$HOME/xsdk-gcc/bin/powerpc-xsdk-elf-gcc" --version
+      - name: Crear fuentes del diagnostico
+        run: |
+          mkdir -p samples/rg1_boot
+          cat > samples/rg1_boot/main.c <<'RG1_SOURCE'
+          // RG1_BOOT_TEST: a visible, non-emulating ROM loader diagnostic for Xbox 360 RGH.
+          // No proprietary ROM contents are embedded in this source or in the XEX.
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          
+          #include "xsdk/gpu.h"
+          #include "xsdk/kernel.h"
+          #include "xsdk/log.h"
+          #include "xsdk/present.h"
+          #include "xsdk/splash.h"
+          #include "xsdk/text.h"
+          
+          #define ROM_BYTES 524288u
+          #define PROGRAM_BYTES (ROM_BYTES * 2u)
+          #define ROM_ODD_CRC 0xC24D7500u
+          #define ROM_EVEN_CRC 0x3F255A4Au
+          
+          static uint8_t rom_odd[ROM_BYTES];
+          static uint8_t rom_even[ROM_BYTES];
+          static uint8_t program[PROGRAM_BYTES];
+          static const char *status_text = "Not checked";
+          static uint32_t sp_value, pc_value, crc_odd, crc_even;
+          static bool roms_valid;
+          
+          static uint32_t crc32_file(const uint8_t *data, size_t length)
+          {
+              uint32_t crc = 0xFFFFFFFFu;
+              for (size_t i = 0; i < length; ++i) {
+                  crc ^= data[i];
+                  for (unsigned j = 0; j < 8; ++j)
+                      crc = (crc >> 1) ^ ((0u - (crc & 1u)) & 0xEDB88320u);
+              }
+              return ~crc;
+          }
+          
+          static uint32_t read_be32(const uint8_t *data)
+          {
+              return (uint32_t)data[0] << 24 | (uint32_t)data[1] << 16 |
+                     (uint32_t)data[2] << 8 | (uint32_t)data[3];
+          }
+          
+          static bool read_chip(const char *path, uint8_t *destination)
+          {
+              FILE *const file = fopen(path, "rb");
+              if (!file)
+                  return false;
+              const size_t count = fread(destination, 1, ROM_BYTES, file);
+              const int extra = fgetc(file);
+              const int close_result = fclose(file);
+              return count == ROM_BYTES && extra == EOF && close_result == 0;
+          }
+          
+          static void check_roms(void)
+          {
+              roms_valid = false;
+              status_text = "ROM files not found in game:/roms/";
+              if (!read_chip("game:/roms/247uba03.bin", rom_odd) ||
+                  !read_chip("game:/roms/247uba04.bin", rom_even))
+                  return;
+          
+              crc_odd = crc32_file(rom_odd, ROM_BYTES);
+              crc_even = crc32_file(rom_even, ROM_BYTES);
+              if (crc_odd != ROM_ODD_CRC || crc_even != ROM_EVEN_CRC) {
+                  status_text = "ROM CRC mismatch: check extracted files";
+                  return;
+              }
+          
+              // The Motorola 68000 fetches big-endian words; 247uba03 occupies even bytes.
+              for (size_t i = 0; i < ROM_BYTES; ++i) {
+                  program[i * 2] = rom_odd[i];
+                  program[i * 2 + 1] = rom_even[i];
+              }
+              sp_value = read_be32(program);
+              pc_value = read_be32(program + 4);
+              if (sp_value != 0x003A0000u || pc_value != 0x0000072Cu) {
+                  status_text = "Program vectors do not match known UBA ROMs";
+                  return;
+              }
+              roms_valid = true;
+              status_text = "PASS: UBA ROMs loaded and vectors verified";
+              xsdk_log_write("rg1: ROMs validated, SP=%08X PC=%08X", (unsigned)sp_value, (unsigned)pc_value);
+          }
+          
+          static void draw_ui(uint32_t width, uint32_t height)
+          {
+              xsdk_gpu_set_target(width, height);
+              xsdk_text_draw(45, 45, 2, 0xFFFFFFFFu, "NBA RUN AND GUN 1");
+              xsdk_text_draw(45, 105, 1, 0xFF80E0FFu, "Xbox 360 RGH - ROM boot diagnostic 01");
+              xsdk_text_draw(45, 155, 1, roms_valid ? 0xFF70FF80u : 0xFFFFC070u, status_text);
+              char info[160];
+              snprintf(info, sizeof info, "247uba03.bin CRC: %08X  (expect C24D7500)", (unsigned)crc_odd);
+              xsdk_text_draw(45, 205, 1, 0xFFFFFFFFu, info);
+              snprintf(info, sizeof info, "247uba04.bin CRC: %08X  (expect 3F255A4A)", (unsigned)crc_even);
+              xsdk_text_draw(45, 235, 1, 0xFFFFFFFFu, info);
+              snprintf(info, sizeof info, "68000 initial SP: %08X     PC: %08X", (unsigned)sp_value, (unsigned)pc_value);
+              xsdk_text_draw(45, 285, 1, 0xFFFFFFFFu, info);
+              xsdk_text_draw(45, 360, 1, 0xFFB8D7FAu, "A = rescan ROMs     BACK = exit to Aurora");
+              xsdk_text_draw(45, 410, 1, 0xFFFFC070u, "This build verifies loading; CPU emulation comes next.");
+          }
+          
+          int main(void)
+          {
+              xsdk_log_write("rg1: boot diagnostic starting");
+              (void)xsdk_splash_show(800);
+              NTSTATUS result = xsdk_gpu_open();
+              if (!NT_SUCCESS(result)) return 1;
+              result = xsdk_text_open();
+              if (!NT_SUCCESS(result)) { (void)xsdk_gpu_close(); return 2; }
+              uint32_t width = 0, height = 0;
+              result = xsdk_present_open(XSDK_DISPLAY_720P, 2, 1, &width, &height);
+              if (!NT_SUCCESS(result)) {
+                  xsdk_text_close(); (void)xsdk_gpu_close(); return 3;
+              }
+              check_roms();
+              uint16_t previous_buttons = 0;
+              for (;;) {
+                  INPUT_STATE state = {0};
+                  uint16_t buttons = 0;
+                  if (XamInputGetState(0, 0, &state) == ERROR_SUCCESS)
+                      buttons = state.gamepad.buttons;
+                  if (buttons & INPUT_GAMEPAD_BACK) break;
+                  if ((buttons & INPUT_GAMEPAD_A) && !(previous_buttons & INPUT_GAMEPAD_A))
+                      check_roms();
+                  previous_buttons = buttons;
+                  uint32_t address = 0;
+                  result = xsdk_present_begin(&address, 5000);
+                  if (!NT_SUCCESS(result)) break;
+                  draw_ui(width, height);
+                  xsdk_gpu_resolve(address, width, height, 0xFF102040u);
+                  xsdk_present_end();
+              }
+              xsdk_present_close();
+              xsdk_text_close();
+              (void)xsdk_gpu_close();
+              xsdk_log_write("rg1: diagnostic done");
+              return 0;
+          }
+          RG1_SOURCE
+          cat > samples/rg1_boot/CMakeLists.txt <<'RG1_CMAKE'
+          cmake_minimum_required(VERSION 3.25)
+          project(rg1_boot C)
+          add_executable(rg1_boot main.c)
+          set_target_properties(rg1_boot PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+          target_compile_options(rg1_boot PRIVATE -Wall -Wextra -Werror)
+          xsdk_add_xex(rg1_boot TITLE_ID 0x58534731 NAME "Run and Gun 1 ROM Diagnostic")
+          RG1_CMAKE
+      - name: Compilar ROM test para Xbox 360
+        run: |
+          make -j2 build/libxsdk.a
+          cmake -S samples/rg1_boot -B build/samples/rg1_boot -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/cmake/xsdk.cmake" \
+            -DXSDK_TOOLCHAIN="$HOME/xsdk-gcc" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build/samples/rg1_boot
+          test -s build/samples/rg1_boot/rg1_boot.xex
+          file build/samples/rg1_boot/rg1_boot.xex
+      - name: Descargar XEX de diagnostico
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RG1_BOOT_TEST
+          path: build/samples/rg1_boot/rg1_boot.xex
+          if-no-files-found: error
+          retention-days: 7
+      - name: Guardar logs si falla
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RG1_BOOT_LOGS
+          path: |
+            /home/runner/xsdk-gcc-work/logs/
+            build/samples/rg1_boot/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 7
