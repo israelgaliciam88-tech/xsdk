@@ -1,0 +1,274 @@
+name: RG1 - CPU 68000 con mapa de ROM completo 02
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rg1-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    permissions:
+      contents: read
+    steps:
+      - name: Obtener codigo XSDK
+        uses: actions/checkout@v4
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev curl xz-utils patch python3 cmake ninja-build git
+      - name: Construir toolchain XSDK
+        env:
+          JOBS: '4'
+        run: |
+          PREFIX="$HOME/xsdk-gcc" WORK="$HOME/xsdk-gcc-work" bash tools/toolchain/build.sh
+          "$HOME/xsdk-gcc/bin/powerpc-xsdk-elf-gcc" --version
+      - name: Obtener Musashi y generar tabla de instrucciones
+        run: |
+          git clone --depth 1 https://github.com/kstenerud/Musashi.git /tmp/rg1-musashi
+          mkdir -p samples/rg1_cpu_v02/musashi
+          cp -r /tmp/rg1-musashi/. samples/rg1_cpu_v02/musashi/
+          cd samples/rg1_cpu_v02/musashi
+          gcc -O2 m68kmake.c -o m68kmake
+          ./m68kmake
+          test -s m68kops.c
+          test -s m68kops.h
+      - name: Crear codigo de diagnostico
+        run: |
+          cat > samples/rg1_cpu_v02/main.c <<'RG1_CPU_SOURCE'
+          /* RG1_CPU_TEST_02 -- bounded Motorola 68000 diagnostic, not a playable game.
+           * Public source contains no copyrighted arcade ROM data.
+           */
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include "m68k.h"
+          #ifdef RG1_XSDK
+          #include "xsdk/gpu.h"
+          #include "xsdk/kernel.h"
+          #include "xsdk/log.h"
+          #include "xsdk/present.h"
+          #include "xsdk/splash.h"
+          #include "xsdk/text.h"
+          #endif
+          #define CHIP_SIZE 524288u
+          #define CODE_SIZE 3145728u
+          #define DATA_CHIP_SIZE 1048576u
+          #define WORK_RAM_START 0x380000u
+          #define WORK_RAM_SIZE 0x20000u
+          static unsigned char chip_a[CHIP_SIZE], chip_b[CHIP_SIZE];
+          static unsigned char data_a[DATA_CHIP_SIZE], data_b[DATA_CHIP_SIZE];
+          static unsigned char palette_ram[0x800], sprite_ram[0x4000], psac_ram[0x20000], line_ram[0x800], text_ram[0x4000];
+          static unsigned char sys_regs[0x20], ccu_regs[0x20], audio_regs[0x20];
+          static unsigned int access_io, ignored_writes, last_ppc, crc_data_a,crc_data_b;
+          static unsigned char code[CODE_SIZE], work_ram[WORK_RAM_SIZE];
+          static unsigned int missing_reads, missing_writes, last_missing;
+          static unsigned int total_cycles, pc, sp, crc_a, crc_b;
+          static bool ready, paused;
+          static const char *message = "Not started";
+          static uint32_t crc32_bytes(const unsigned char *src, unsigned int length) {
+              uint32_t crc = 0xffffffffu;
+              for (unsigned int i=0; i<length; ++i) {
+                  crc ^= src[i];
+                  for (unsigned j=0; j<8; ++j) crc=(crc >> 1) ^ ((0u-(crc & 1u))&0xedb88320u);
+              }
+              return ~crc;
+          }
+          static int read_exact(const char *path,unsigned char *out,size_t length) {
+              FILE *file=fopen(path,"rb"); if(!file)return 0;
+              size_t n=fread(out,1,length,file); int extra=fgetc(file);
+              int rc=fclose(file);return n==length && extra==EOF && rc==0;
+          }
+          static void note_missing(unsigned int address,int write) {
+              last_missing=address;
+              if(write) { if(missing_writes<0xffffffffu)++missing_writes; }
+              else { if(missing_reads<0xffffffffu)++missing_reads; }
+          }
+          static unsigned char *ram_at(unsigned address) {
+              if(address>=0x300000u && address<0x300800u) return &palette_ram[address-0x300000u];
+              if(address>=0x380000u && address<0x3a0000u) return &work_ram[address-0x380000u];
+              if(address>=0x600000u && address<0x602000u) return &sprite_ram[address-0x600000u];
+              if(address>=0x6c0000u && address<0x6d0000u) return &psac_ram[address-0x6c0000u];
+              if(address>=0x700000u && address<0x700800u) return &line_ram[address-0x700000u];
+              if(address>=0x740000u && address<0x742000u) return &text_ram[address-0x740000u];
+              return NULL;
+          }
+          /* Device registers are placeholders: count the accesses, not functioning arcade chips. */
+          static unsigned char *io_at(unsigned address) {
+              if(address>=0x480000u && address<0x480020u) return &sys_regs[address-0x480000u];
+              if(address>=0x4c0000u && address<0x4c0020u) return &ccu_regs[address-0x4c0000u];
+              if(address>=0x580000u && address<0x580020u) return &audio_regs[address-0x580000u];
+              return NULL;
+          }
+          unsigned int m68k_read_memory_8(unsigned int address) {
+              address &= 0xffffffu;
+              if(address<CODE_SIZE)return code[address];
+              unsigned char *p=ram_at(address); if(p)return *p;
+              p=io_at(address); if(p){access_io++;return *p;}
+              note_missing(address,0);return 0xffu;
+          }
+          unsigned int m68k_read_memory_16(unsigned int address) {
+              return (m68k_read_memory_8(address)<<8) | m68k_read_memory_8(address+1);
+          }
+          unsigned int m68k_read_memory_32(unsigned int address) {
+              return (m68k_read_memory_16(address)<<16) | m68k_read_memory_16(address+2);
+          }
+          void m68k_write_memory_8(unsigned int address, unsigned int value) {
+              address &= 0xffffffu;
+              unsigned char *p=ram_at(address); if(p){*p=(unsigned char)value;return;}
+              p=io_at(address); if(p){*p=(unsigned char)value;access_io++;return;}
+              if(address<CODE_SIZE || address==0x7c0000u || address==0x7c0001u) {ignored_writes++;return;}
+              note_missing(address,1);
+          }
+          void m68k_write_memory_16(unsigned int address,unsigned int value) {
+              m68k_write_memory_8(address,value>>8);m68k_write_memory_8(address+1,value);
+          }
+          void m68k_write_memory_32(unsigned int address,unsigned int value) {
+              m68k_write_memory_16(address,value>>16);m68k_write_memory_16(address+2,value);
+          }
+          static void boot_roms(const char *folder) {
+              char a[256],b[256],da[256],db[256];
+              ready=false;paused=false;total_cycles=missing_reads=missing_writes=last_missing=0;
+              access_io=ignored_writes=last_ppc=0;
+              pc=sp=crc_a=crc_b=crc_data_a=crc_data_b=0;
+              snprintf(a,sizeof a,"%s/247uba03.bin",folder);
+              snprintf(b,sizeof b,"%s/247uba04.bin",folder);
+              snprintf(da,sizeof da,"%s/247b01.23n",folder);
+              snprintf(db,sizeof db,"%s/247b02.21n",folder);
+              if(!read_exact(a,chip_a,CHIP_SIZE)||!read_exact(b,chip_b,CHIP_SIZE) ||
+                 !read_exact(da,data_a,DATA_CHIP_SIZE)||!read_exact(db,data_b,DATA_CHIP_SIZE)) {
+                  message="ERROR: 4 ROM chips required";return;
+              }
+              crc_a=crc32_bytes(chip_a,CHIP_SIZE);crc_b=crc32_bytes(chip_b,CHIP_SIZE);
+              crc_data_a=crc32_bytes(data_a,DATA_CHIP_SIZE);crc_data_b=crc32_bytes(data_b,DATA_CHIP_SIZE);
+              if(crc_a!=0xc24d7500u||crc_b!=0x3f255a4au ||
+                 crc_data_a!=0x2d774f27u||crc_data_b!=0xd088c9deu) {
+                  message="ERROR: ROM CRC mismatch";return;
+              }
+              for(unsigned i=0;i<CHIP_SIZE;++i) {
+                 code[2*i]=chip_a[i];code[2*i+1]=chip_b[i];
+                 code[0x200000u+2*i]=data_a[i];code[0x200001u+2*i]=data_b[i];
+                 code[0x100000u+2*i]=data_a[CHIP_SIZE+i];code[0x100001u+2*i]=data_b[CHIP_SIZE+i];
+              }
+              memset(palette_ram,0,sizeof(palette_ram));memset(work_ram,0,sizeof(work_ram));
+              memset(sprite_ram,0,sizeof(sprite_ram));memset(psac_ram,0,sizeof(psac_ram));
+              memset(line_ram,0,sizeof(line_ram));memset(text_ram,0,sizeof(text_ram));
+              memset(sys_regs,0,sizeof(sys_regs));memset(ccu_regs,0,sizeof(ccu_regs));memset(audio_regs,0,sizeof(audio_regs));
+              m68k_init();m68k_set_cpu_type(M68K_CPU_TYPE_68000);m68k_pulse_reset();
+              pc=m68k_get_reg(NULL,M68K_REG_PC);sp=m68k_get_reg(NULL,M68K_REG_SP);
+              if(pc!=0x72cu||sp!=0x3a0000u) {message="ERROR: boot vectors differ";return;}
+              ready=true;message="CPU ACTIVE - 3MB ROM, provisional hardware";
+          }
+          static void run_chunk(void) {
+              if(!ready||paused||total_cycles>=2000000u)return;
+              /* PPC captures the preceding instruction when a branch enters a bad area. */
+              int used=m68k_execute(8000);if(used>0)total_cycles+=(unsigned int)used;
+              pc=m68k_get_reg(NULL,M68K_REG_PC);sp=m68k_get_reg(NULL,M68K_REG_SP);
+              last_ppc=m68k_get_reg(NULL,M68K_REG_PPC);
+              if(pc>=CODE_SIZE && !(pc>=WORK_RAM_START && pc<WORK_RAM_START+WORK_RAM_SIZE)) {
+                  paused=true;message="STOP: PC outside program ROM / work RAM";
+              }
+              if(total_cycles>=2000000u) {paused=true;message="AUTO STOP: 2M cycles reached";}
+          }
+          #ifdef RG1_XSDK
+          static void draw_ui(uint32_t w,uint32_t h) {
+              char s[180];
+              xsdk_gpu_set_target(w,h);
+              xsdk_text_draw(38,35,2,0xffffffffu,"NBA RUN AND GUN 1 - CPU TEST 02");
+              xsdk_text_draw(38,92,1,0xff80e0ffu,"Xbox 360 RGH / Musashi Motorola 68000");
+              xsdk_text_draw(38,145,1,ready?0xff60ff8au:0xffffaa66u,message);
+              snprintf(s,sizeof(s),"Program CRC: %08X / %08X",(unsigned)crc_a,(unsigned)crc_b);
+              xsdk_text_draw(38,196,1,0xffffffffu,s);
+              snprintf(s,sizeof(s),"PC: %08X  SP: %08X  cycles: %u",pc,sp,total_cycles);
+              xsdk_text_draw(38,239,1,0xffffffffu,s);
+              snprintf(s,sizeof(s),"Data CRC: %08X / %08X",crc_data_a,crc_data_b);
+              xsdk_text_draw(38,258,1,0xffffffffu,s);
+              snprintf(s,sizeof(s),"Unmapped reads: %u   writes: %u",missing_reads,missing_writes);
+              xsdk_text_draw(38,282,1,0xffffff88u,s);
+              snprintf(s,sizeof(s),"Last unmapped: %06X  previous PC: %06X",last_missing,last_ppc);
+              xsdk_text_draw(38,320,1,0xffffff88u,s);
+              snprintf(s,sizeof(s),"Device I/O placeholder accesses: %u",access_io);
+              xsdk_text_draw(38,355,1,0xffffff88u,s);
+              xsdk_text_draw(38,390,1,0xffb8d7fau,"A = restart CPU   B = pause/resume   BACK = Aurora");
+              xsdk_text_draw(38,433,1,0xffffaa66u,"DIAGNOSTIC ONLY: hardware devices not emulated yet");
+              xsdk_text_draw(38,465,1,0xffffaa66u,"No IRQ, graphics, sound or gameplay in this build");
+          }
+          int main(void) {
+              (void)xsdk_splash_show(600);
+              NTSTATUS result=xsdk_gpu_open();if(!NT_SUCCESS(result))return 1;
+              result=xsdk_text_open();if(!NT_SUCCESS(result)){(void)xsdk_gpu_close();return 2;}
+              uint32_t w=0,h=0;
+              result=xsdk_present_open(XSDK_DISPLAY_720P,2,1,&w,&h);
+              if(!NT_SUCCESS(result)){xsdk_text_close();(void)xsdk_gpu_close();return 3;}
+              boot_roms("game:/roms");
+              uint16_t prev=0;
+              for(;;) {
+                  INPUT_STATE state={0};uint16_t keys=0;
+                  if(XamInputGetState(0,0,&state)==ERROR_SUCCESS)keys=state.gamepad.buttons;
+                  if(keys & INPUT_GAMEPAD_BACK)break;
+                  if((keys&INPUT_GAMEPAD_A)&&!(prev&INPUT_GAMEPAD_A))boot_roms("game:/roms");
+                  if((keys&INPUT_GAMEPAD_B)&&!(prev&INPUT_GAMEPAD_B))paused=!paused;
+                  prev=keys;
+                  run_chunk();
+                  uint32_t address=0;
+                  result=xsdk_present_begin(&address,5000);
+                  if(!NT_SUCCESS(result))break;
+                  draw_ui(w,h);
+                  xsdk_gpu_resolve(address,w,h,0xff102040u);
+                  xsdk_present_end();
+              }
+              xsdk_present_close();xsdk_text_close();(void)xsdk_gpu_close();
+              return 0;
+          }
+          #else
+          int main(int argc,char **argv){
+              const char *dir=argc>1?argv[1]:"roms";
+              boot_roms(dir);printf("start: %s PC=%08X SP=%08X CRC=%08X/%08X\n",message,pc,sp,crc_a,crc_b);
+              for(int i=0;i<250;++i)run_chunk();
+              printf("end: %s PC=%08X SP=%08X cycles=%u missing R=%u W=%u last=%06X\n",message,pc,sp,total_cycles,missing_reads,missing_writes,last_missing);
+              return ready?0:1;
+          }
+          #endif
+          RG1_CPU_SOURCE
+          cat > samples/rg1_cpu_v02/CMakeLists.txt <<'RG1_CMAKE'
+          cmake_minimum_required(VERSION 3.25)
+          project(rg1_cpu_v02 C)
+          add_executable(rg1_cpu_v02
+            main.c
+            musashi/m68kcpu.c
+            musashi/m68kops.c
+            musashi/softfloat/softfloat.c
+          )
+          set_target_properties(rg1_cpu_v02 PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+          target_compile_definitions(rg1_cpu_v02 PRIVATE RG1_XSDK=1)
+          target_include_directories(rg1_cpu_v02 PRIVATE musashi)
+          xsdk_add_xex(rg1_cpu_v02 TITLE_ID 0x58534731 NAME "Run and Gun 1 CPU Diagnostic")
+          RG1_CMAKE
+      - name: Compilar CPU para Xbox 360
+        run: |
+          make -j2 build/libxsdk.a
+          cmake -S samples/rg1_cpu_v02 -B build/samples/rg1_cpu_v02 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/cmake/xsdk.cmake" \
+            -DXSDK_TOOLCHAIN="$HOME/xsdk-gcc" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build/samples/rg1_cpu_v02
+          test -s build/samples/rg1_cpu_v02/rg1_cpu_v02.xex
+          file build/samples/rg1_cpu_v02/rg1_cpu_v02.xex
+      - name: Descargar XEX diagnostico CPU
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RG1_CPU_TEST_02
+          path: build/samples/rg1_cpu_v02/rg1_cpu_v02.xex
+          if-no-files-found: error
+          retention-days: 7
+      - name: Guardar registros si falla
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RG1_CPU_LOGS
+          path: |
+            /home/runner/xsdk-gcc-work/logs/
+            build/samples/rg1_cpu_v02/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 7
